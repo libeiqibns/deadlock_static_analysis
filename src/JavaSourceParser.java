@@ -45,13 +45,22 @@ public class JavaSourceParser {
     // Statement type for synchronized blocks.
     public static class SynchronizedStatement extends Statement {
         public String expression; // the monitor expression used in synchronized(...)
+        public List<Statement> enclosedStatements;
         public SynchronizedStatement(String expression, int lineNumber) {
             super(lineNumber);
             this.expression = expression;
+            this.enclosedStatements = new ArrayList<>();
         }
         @Override
         public String toString() {
-            return "Line " + lineNumber + ": synchronized(" + expression + ") { ... }";
+            StringBuilder sb = new StringBuilder();
+            sb.append("Line ").append(lineNumber)
+              .append(": synchronized(").append(expression).append(") {");
+            for (Statement stmt : enclosedStatements) {
+                sb.append("\n    ").append(stmt.toString());
+            }
+            sb.append("\n}");
+            return sb.toString();
         }
     }
 
@@ -74,12 +83,14 @@ public class JavaSourceParser {
         @Override
         public String toString() {
             StringBuilder sb = new StringBuilder();
-            sb.append("Line ").append(lineNumber).append(": ").append(returnType)
-              .append(" ").append(name).append("(").append(parameters).append(")");
-            sb.append("\n    Statements:");
+            sb.append("Line ").append(lineNumber)
+              .append(": ").append(returnType)
+              .append(" ").append(name)
+              .append("(").append(parameters).append(") {");
             for (Statement stmt : statements) {
-                sb.append("\n        ").append(stmt);
+                sb.append("\n    ").append(stmt.toString());
             }
+            sb.append("\n}");
             return sb.toString();
         }
     }
@@ -98,11 +109,11 @@ public class JavaSourceParser {
         }
     }
 
-    // Global collections (for declarations outside functions)
+    // Global collections to hold parsed data.
     private List<FunctionDeclaration> functions = new ArrayList<>();
     private List<Statement> globalStatements = new ArrayList<>();
 
-    // Precompiled regex patterns as class-level constants
+    // Precompiled regex patterns.
     private static final Pattern FUNCTION_PATTERN = Pattern.compile(
             "((?:public|protected|private|static|final|abstract|synchronized)\\s+)*" + // optional modifiers
             "([\\w<>\\[\\]]+)\\s+" +                   // return type
@@ -110,28 +121,92 @@ public class JavaSourceParser {
             "\\(([^)]*)\\)\\s*" +                      // parameter list
             "(?:throws\\s+[\\w\\s,]+)?\\s*\\{");        // optional throws clause and opening brace
 
-    // Note: This pattern is simplistic and matches one variable declaration per line.
+    // This pattern is simplistic and matches a single variable declaration per line.
     private static final Pattern VARIABLE_PATTERN = Pattern.compile(
             "([\\w<>\\[\\]]+)\\s+" +    // variable type
             "(\\w+)\\s*" +              // variable name
             "(?:=\\s*[^;]+)?;");         // optional initialization
 
+    // Pattern for synchronized statements.
     private static final Pattern SYNCHRONIZED_PATTERN = Pattern.compile(
             "synchronized\\s*\\(([^)]+)\\)\\s*\\{");
 
+    // Helper class to hold the result of parsing a block.
+    private static class ParseResult {
+        public List<Statement> statements;
+        public int nextLineIndex; // index of the line with the closing brace
+        public ParseResult(List<Statement> statements, int nextLineIndex) {
+            this.statements = statements;
+            this.nextLineIndex = nextLineIndex;
+        }
+    }
+
+    /**
+     * Recursively parses a block of code.
+     * A block is expected to end with a line that contains only "}".
+     * The closing brace is not added as a statement.
+     *
+     * @param lines The list of all source lines.
+     * @param startIndex The index to start parsing from.
+     * @return A ParseResult containing the list of statements in the block and the index of the closing brace.
+     */
+    private ParseResult parseBlock(List<String> lines, int startIndex) {
+        List<Statement> statements = new ArrayList<>();
+        int i = startIndex;
+        while (i < lines.size()) {
+            String line = lines.get(i).trim();
+            // If this line is a closing brace, end of block.
+            if (line.equals("}")) {
+                return new ParseResult(statements, i);
+            }
+            // If the line starts a synchronized block, parse it recursively.
+            Matcher syncMatcher = SYNCHRONIZED_PATTERN.matcher(line);
+            if (syncMatcher.find()) {
+                String expression = syncMatcher.group(1).trim();
+                int syncLineNumber = i + 1;
+                // Move to the next line after the synchronized header.
+                i++;
+                ParseResult innerResult = parseBlock(lines, i);
+                SynchronizedStatement syncStmt = new SynchronizedStatement(expression, syncLineNumber);
+                syncStmt.enclosedStatements.addAll(innerResult.statements);
+                statements.add(syncStmt);
+                // Continue after the closing brace of the synchronized block.
+                i = innerResult.nextLineIndex + 1;
+                continue;
+            }
+            // Check if the line is a variable declaration.
+            Matcher varMatcher = VARIABLE_PATTERN.matcher(line);
+            if (varMatcher.find()) {
+                String varType = varMatcher.group(1);
+                String varName = varMatcher.group(2);
+                statements.add(new VariableDeclaration(varType, varName, i + 1));
+                i++;
+                continue;
+            }
+            // Otherwise, treat the line as a generic statement.
+            statements.add(new GenericStatement(line, i + 1));
+            i++;
+        }
+        // If we run out of lines without finding a closing brace, return what we have.
+        return new ParseResult(statements, i);
+    }
+
     /**
      * Parses the given Java source file.
+     *
      * @param file The Java source file to parse.
      * @throws IOException if an I/O error occurs reading the file.
      */
     public void parse(File file) throws IOException {
-        // Read all lines from the file.
         List<String> lines = Files.readAllLines(file.toPath());
-        
-        // We'll iterate line-by-line.
-        for (int i = 0; i < lines.size(); i++) {
+        int i = 0;
+        while (i < lines.size()) {
             String line = lines.get(i).trim();
-
+            // Skip empty lines.
+            if (line.isEmpty()) {
+                i++;
+                continue;
+            }
             // Check for a function declaration.
             Matcher funcMatcher = FUNCTION_PATTERN.matcher(line);
             if (funcMatcher.find()) {
@@ -139,9 +214,7 @@ public class JavaSourceParser {
                 String methodName = funcMatcher.group(3);
                 String params = funcMatcher.group(4).trim();
                 List<Parameter> paramList = new ArrayList<>();
-
                 if (!params.isEmpty()) {
-                    // Split parameters by comma and then by whitespace to separate type and name.
                     String[] paramParts = params.split(",");
                     for (String param : paramParts) {
                         param = param.trim();
@@ -153,71 +226,47 @@ public class JavaSourceParser {
                         }
                     }
                 }
-                // Create the function declaration and record the line number (1-indexed).
                 FunctionDeclaration functionDecl = new FunctionDeclaration(returnType, methodName, paramList, i + 1);
-
-                // Process the function body to capture its statements.
-                // Start by counting the braces on the function declaration line.
-                int braceCount = countOccurrences(line, '{') - countOccurrences(line, '}');
-                // Continue reading lines until we match all opened braces.
-                while (braceCount > 0 && i < lines.size() - 1) {
-                    i++;
-                    String bodyLine = lines.get(i);
-                    // Parse the body line as a Statement.
-                    Statement stmt = parseStatement(bodyLine, i + 1);
-                    functionDecl.statements.add(stmt);
-                    braceCount += countOccurrences(bodyLine, '{') - countOccurrences(bodyLine, '}');
-                }
+                // The function header regex includes the opening brace; so the body starts on the next line.
+                i++;
+                ParseResult result = parseBlock(lines, i);
+                functionDecl.statements.addAll(result.statements);
+                // Skip the closing brace line.
+                i = result.nextLineIndex + 1;
                 functions.add(functionDecl);
                 continue;
             }
-
-            // Process global variable declarations and synchronized statements.
-            Statement globalStmt = parseStatement(line, i + 1);
-            // If the line was not empty (after trimming), record it globally.
-            if (!(globalStmt instanceof GenericStatement && ((GenericStatement) globalStmt).text.isEmpty())) {
-                globalStatements.add(globalStmt);
+            // Process global-level synchronized block.
+            Matcher syncMatcher = SYNCHRONIZED_PATTERN.matcher(line);
+            if (syncMatcher.find()) {
+                String expression = syncMatcher.group(1).trim();
+                int syncLineNumber = i + 1;
+                i++;
+                ParseResult result = parseBlock(lines, i);
+                SynchronizedStatement syncStmt = new SynchronizedStatement(expression, syncLineNumber);
+                syncStmt.enclosedStatements.addAll(result.statements);
+                globalStatements.add(syncStmt);
+                i = result.nextLineIndex + 1;
+                continue;
             }
-        }
-    }
-
-    /**
-     * Parses a single line as a Statement.
-     * Checks if the line matches a variable declaration or a synchronized statement.
-     * Otherwise, returns a GenericStatement containing the raw text.
-     *
-     * @param line The line of source code.
-     * @param lineNumber The line number (1-indexed).
-     * @return A Statement object representing the line.
-     */
-    private Statement parseStatement(String line, int lineNumber) {
-        String trimmed = line.trim();
-        // Check for variable declaration.
-        Matcher varMatcher = VARIABLE_PATTERN.matcher(trimmed);
-        if (varMatcher.find()) {
-            String varType = varMatcher.group(1);
-            String varName = varMatcher.group(2);
-            return new VariableDeclaration(varType, varName, lineNumber);
-        }
-        // Check for synchronized statement.
-        Matcher syncMatcher = SYNCHRONIZED_PATTERN.matcher(trimmed);
-        if (syncMatcher.find()) {
-            String expression = syncMatcher.group(1).trim();
-            return new SynchronizedStatement(expression, lineNumber);
-        }
-        // Otherwise, return a generic statement.
-        return new GenericStatement(trimmed, lineNumber);
-    }
-
-    // Helper method to count occurrences of a character in a string.
-    private static int countOccurrences(String text, char c) {
-        int count = 0;
-        for (char ch : text.toCharArray()) {
-            if (ch == c) {
-                count++;
+            // Process global-level variable declaration.
+            Matcher varMatcher = VARIABLE_PATTERN.matcher(line);
+            if (varMatcher.find()) {
+                String varType = varMatcher.group(1);
+                String varName = varMatcher.group(2);
+                globalStatements.add(new VariableDeclaration(varType, varName, i + 1));
+                i++;
+                continue;
             }
+            // Otherwise, treat as a generic global statement.
+            // Also, if the line is just a closing brace, skip it.
+            if (line.equals("}")) {
+                i++;
+                continue;
+            }
+            globalStatements.add(new GenericStatement(line, i + 1));
+            i++;
         }
-        return count;
     }
 
     // Methods to retrieve the parsed data.
@@ -229,7 +278,7 @@ public class JavaSourceParser {
         return globalStatements;
     }
 
-    // Utility method to print parsed data.
+    // Utility method to print the parsed data.
     public void printParsedData() {
         System.out.println("---- Function Declarations ----");
         for (FunctionDeclaration func : functions) {

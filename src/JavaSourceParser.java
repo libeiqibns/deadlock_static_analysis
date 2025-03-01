@@ -71,6 +71,7 @@ public class JavaSourceParser {
         public List<Parameter> parameters;
         public int lineNumber; // the line where the function is declared
         public List<Statement> statements; // all statements inside the function body
+        public boolean isSynchronized;   // true if declared with the synchronized modifier
 
         public FunctionDeclaration(String returnType, String name, List<Parameter> parameters, int lineNumber) {
             this.returnType = returnType;
@@ -78,11 +79,13 @@ public class JavaSourceParser {
             this.parameters = parameters;
             this.lineNumber = lineNumber;
             this.statements = new ArrayList<>();
+            this.isSynchronized = false;
         }
         
         @Override
         public String toString() {
             StringBuilder sb = new StringBuilder();
+            // Note: The synchronized keyword is de-sugared away.
             sb.append("Line ").append(lineNumber)
               .append(": ").append(returnType)
               .append(" ").append(name)
@@ -114,6 +117,7 @@ public class JavaSourceParser {
     private List<Statement> globalStatements = new ArrayList<>();
 
     // Precompiled regex patterns.
+    // Function pattern includes modifiers (like synchronized) and the opening brace.
     private static final Pattern FUNCTION_PATTERN = Pattern.compile(
             "((?:public|protected|private|static|final|abstract|synchronized)\\s+)*" + // optional modifiers
             "([\\w<>\\[\\]]+)\\s+" +                   // return type
@@ -121,7 +125,7 @@ public class JavaSourceParser {
             "\\(([^)]*)\\)\\s*" +                      // parameter list
             "(?:throws\\s+[\\w\\s,]+)?\\s*\\{");        // optional throws clause and opening brace
 
-    // This pattern is simplistic and matches a single variable declaration per line.
+    // Simplistic pattern for variable declarations (one per line).
     private static final Pattern VARIABLE_PATTERN = Pattern.compile(
             "([\\w<>\\[\\]]+)\\s+" +    // variable type
             "(\\w+)\\s*" +              // variable name
@@ -155,7 +159,7 @@ public class JavaSourceParser {
         int i = startIndex;
         while (i < lines.size()) {
             String line = lines.get(i).trim();
-            // If this line is a closing brace, end of block.
+            // End of block.
             if (line.equals("}")) {
                 return new ParseResult(statements, i);
             }
@@ -164,17 +168,15 @@ public class JavaSourceParser {
             if (syncMatcher.find()) {
                 String expression = syncMatcher.group(1).trim();
                 int syncLineNumber = i + 1;
-                // Move to the next line after the synchronized header.
-                i++;
+                i++; // move past the synchronized header line
                 ParseResult innerResult = parseBlock(lines, i);
                 SynchronizedStatement syncStmt = new SynchronizedStatement(expression, syncLineNumber);
                 syncStmt.enclosedStatements.addAll(innerResult.statements);
                 statements.add(syncStmt);
-                // Continue after the closing brace of the synchronized block.
                 i = innerResult.nextLineIndex + 1;
                 continue;
             }
-            // Check if the line is a variable declaration.
+            // Check for variable declaration.
             Matcher varMatcher = VARIABLE_PATTERN.matcher(line);
             if (varMatcher.find()) {
                 String varType = varMatcher.group(1);
@@ -187,7 +189,7 @@ public class JavaSourceParser {
             statements.add(new GenericStatement(line, i + 1));
             i++;
         }
-        // If we run out of lines without finding a closing brace, return what we have.
+        // If no closing brace is found, return what we have.
         return new ParseResult(statements, i);
     }
 
@@ -210,6 +212,7 @@ public class JavaSourceParser {
             // Check for a function declaration.
             Matcher funcMatcher = FUNCTION_PATTERN.matcher(line);
             if (funcMatcher.find()) {
+                String modifiers = funcMatcher.group(1);
                 String returnType = funcMatcher.group(2);
                 String methodName = funcMatcher.group(3);
                 String params = funcMatcher.group(4).trim();
@@ -227,10 +230,21 @@ public class JavaSourceParser {
                     }
                 }
                 FunctionDeclaration functionDecl = new FunctionDeclaration(returnType, methodName, paramList, i + 1);
-                // The function header regex includes the opening brace; so the body starts on the next line.
+                // Check if the function is declared as synchronized.
+                if (modifiers != null && modifiers.contains("synchronized")) {
+                    functionDecl.isSynchronized = true;
+                }
+                // The function header regex includes the opening brace; the body starts on the next line.
                 i++;
                 ParseResult result = parseBlock(lines, i);
-                functionDecl.statements.addAll(result.statements);
+                // If the function is synchronized, wrap its body inside a synchronized(this) block.
+                if (functionDecl.isSynchronized) {
+                    SynchronizedStatement outerSync = new SynchronizedStatement("this", functionDecl.lineNumber);
+                    outerSync.enclosedStatements.addAll(result.statements);
+                    functionDecl.statements.add(outerSync);
+                } else {
+                    functionDecl.statements.addAll(result.statements);
+                }
                 // Skip the closing brace line.
                 i = result.nextLineIndex + 1;
                 functions.add(functionDecl);
@@ -258,8 +272,7 @@ public class JavaSourceParser {
                 i++;
                 continue;
             }
-            // Otherwise, treat as a generic global statement.
-            // Also, if the line is just a closing brace, skip it.
+            // Otherwise, treat as a generic global statement (skip lone closing braces).
             if (line.equals("}")) {
                 i++;
                 continue;

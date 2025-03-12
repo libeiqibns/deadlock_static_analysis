@@ -46,16 +46,29 @@ public class JavaSourceParser {
     public static class SynchronizedStatement extends Statement {
         public String expression; // the monitor expression used in synchronized(...)
         public List<Statement> enclosedStatements;
+        // Fields to record the type and declaration line of the monitor object.
+        public String objectType;          // For a normal variable, its type;
+                                          // For "this", the current class name.
+        public String objectDeclarationLine;  // Either a numeric line (as a string) or "ground".
+
         public SynchronizedStatement(String expression, int lineNumber) {
             super(lineNumber);
             this.expression = expression;
             this.enclosedStatements = new ArrayList<>();
+            this.objectType = null;
+            this.objectDeclarationLine = null;
         }
         @Override
         public String toString() {
             StringBuilder sb = new StringBuilder();
             sb.append("Line ").append(lineNumber)
-              .append(": synchronized(").append(expression).append(") {");
+              .append(": synchronized(").append(expression);
+            if (objectType != null) {
+                sb.append(" /* type: ").append(objectType)
+                  .append(", declared at: ").append(objectDeclarationLine)
+                  .append(" */");
+            }
+            sb.append(") {");
             for (Statement stmt : enclosedStatements) {
                 sb.append("\n    ").append(stmt.toString());
             }
@@ -111,13 +124,41 @@ public class JavaSourceParser {
             return type + " " + name;
         }
     }
-
+    
+    // Each node in the lock-order graph is identified by a string (the lock’s unique ID).
+    // An edge from node A to node B means that while holding lock A, lock B is acquired.
+    public static class LockOrderGraph {
+        private Map<String, Set<String>> edges = new HashMap<>();
+        
+        public void addEdge(String from, String to) {
+            edges.computeIfAbsent(from, k -> new HashSet<>()).add(to);
+        }
+        
+        public Map<String, Set<String>> getEdges() {
+            return edges;
+        }
+        
+        public void printGraph() {
+            System.out.println("Lock Order Graph:");
+            for (Map.Entry<String, Set<String>> entry : edges.entrySet()) {
+                String from = entry.getKey();
+                for (String to : entry.getValue()) {
+                    System.out.println("  " + from + " -> " + to);
+                }
+            }
+        }
+    }
+    
     // Global collections to hold parsed data.
     private List<FunctionDeclaration> functions = new ArrayList<>();
     private List<Statement> globalStatements = new ArrayList<>();
-
+    // Global symbol table for top-level declarations.
+    private Map<String, VariableDeclaration> globalSymbols = new HashMap<>();
+    
+    // Current class name found in the source file.
+    private String currentClass = "Unknown";
+    
     // Precompiled regex patterns.
-    // Function pattern includes modifiers (like synchronized) and the opening brace.
     private static final Pattern FUNCTION_PATTERN = Pattern.compile(
             "((?:public|protected|private|static|final|abstract|synchronized)\\s+)*" + // optional modifiers
             "([\\w<>\\[\\]]+)\\s+" +                   // return type
@@ -125,16 +166,18 @@ public class JavaSourceParser {
             "\\(([^)]*)\\)\\s*" +                      // parameter list
             "(?:throws\\s+[\\w\\s,]+)?\\s*\\{");        // optional throws clause and opening brace
 
-    // Simplistic pattern for variable declarations (one per line).
     private static final Pattern VARIABLE_PATTERN = Pattern.compile(
             "([\\w<>\\[\\]]+)\\s+" +    // variable type
             "(\\w+)\\s*" +              // variable name
             "(?:=\\s*[^;]+)?;");         // optional initialization
 
-    // Pattern for synchronized statements.
     private static final Pattern SYNCHRONIZED_PATTERN = Pattern.compile(
             "synchronized\\s*\\(([^)]+)\\)\\s*\\{");
 
+    private static final Pattern SIMPLE_IDENTIFIER_PATTERN = Pattern.compile("^\\w+$");
+
+    private static final Pattern CLASS_PATTERN = Pattern.compile("class\\s+(\\w+)");
+    
     // Helper class to hold the result of parsing a block.
     private static class ParseResult {
         public List<Statement> statements;
@@ -144,7 +187,7 @@ public class JavaSourceParser {
             this.nextLineIndex = nextLineIndex;
         }
     }
-
+    
     /**
      * Recursively parses a block of code.
      * A block is expected to end with a line that contains only "}".
@@ -152,47 +195,63 @@ public class JavaSourceParser {
      *
      * @param lines The list of all source lines.
      * @param startIndex The index to start parsing from.
+     * @param localSymbols The symbol table (variable name -> VariableDeclaration) for the current block.
      * @return A ParseResult containing the list of statements in the block and the index of the closing brace.
      */
-    private ParseResult parseBlock(List<String> lines, int startIndex) {
+    private ParseResult parseBlock(List<String> lines, int startIndex, Map<String, VariableDeclaration> localSymbols) {
         List<Statement> statements = new ArrayList<>();
         int i = startIndex;
+        // Inherit the parent symbol table.
+        Map<String, VariableDeclaration> currentSymbols = new HashMap<>(localSymbols);
         while (i < lines.size()) {
             String line = lines.get(i).trim();
-            // End of block.
             if (line.equals("}")) {
                 return new ParseResult(statements, i);
             }
-            // If the line starts a synchronized block, parse it recursively.
+            // Handle synchronized blocks.
             Matcher syncMatcher = SYNCHRONIZED_PATTERN.matcher(line);
             if (syncMatcher.find()) {
                 String expression = syncMatcher.group(1).trim();
                 int syncLineNumber = i + 1;
-                i++; // move past the synchronized header line
-                ParseResult innerResult = parseBlock(lines, i);
+                i++; // move past synchronized header
+                ParseResult innerResult = parseBlock(lines, i, currentSymbols);
                 SynchronizedStatement syncStmt = new SynchronizedStatement(expression, syncLineNumber);
+                if ("this".equals(expression)) {
+                    syncStmt.objectType = currentClass;
+                    syncStmt.objectDeclarationLine = "ground";
+                } else {
+                    Matcher idMatcher = SIMPLE_IDENTIFIER_PATTERN.matcher(expression);
+                    if (idMatcher.find()) {
+                        VariableDeclaration decl = currentSymbols.get(expression);
+                        if (decl != null) {
+                            syncStmt.objectType = decl.type;
+                            syncStmt.objectDeclarationLine = String.valueOf(decl.lineNumber);
+                        }
+                    }
+                }
                 syncStmt.enclosedStatements.addAll(innerResult.statements);
                 statements.add(syncStmt);
                 i = innerResult.nextLineIndex + 1;
                 continue;
             }
-            // Check for variable declaration.
+            // Variable declarations.
             Matcher varMatcher = VARIABLE_PATTERN.matcher(line);
             if (varMatcher.find()) {
                 String varType = varMatcher.group(1);
                 String varName = varMatcher.group(2);
-                statements.add(new VariableDeclaration(varType, varName, i + 1));
+                VariableDeclaration varDecl = new VariableDeclaration(varType, varName, i + 1);
+                statements.add(varDecl);
+                currentSymbols.put(varName, varDecl);
                 i++;
                 continue;
             }
-            // Otherwise, treat the line as a generic statement.
+            // Otherwise, a generic statement.
             statements.add(new GenericStatement(line, i + 1));
             i++;
         }
-        // If no closing brace is found, return what we have.
         return new ParseResult(statements, i);
     }
-
+    
     /**
      * Parses the given Java source file.
      *
@@ -201,15 +260,23 @@ public class JavaSourceParser {
      */
     public void parse(File file) throws IOException {
         List<String> lines = Files.readAllLines(file.toPath());
+        // Extract current class name.
+        for (String l : lines) {
+            Matcher classMatcher = CLASS_PATTERN.matcher(l);
+            if (classMatcher.find()) {
+                currentClass = classMatcher.group(1);
+                break;
+            }
+        }
+        
         int i = 0;
         while (i < lines.size()) {
             String line = lines.get(i).trim();
-            // Skip empty lines.
             if (line.isEmpty()) {
                 i++;
                 continue;
             }
-            // Check for a function declaration.
+            // Function declarations.
             Matcher funcMatcher = FUNCTION_PATTERN.matcher(line);
             if (funcMatcher.find()) {
                 String modifiers = funcMatcher.group(1);
@@ -223,56 +290,71 @@ public class JavaSourceParser {
                         param = param.trim();
                         String[] tokens = param.split("\\s+");
                         if (tokens.length >= 2) {
-                            String paramType = tokens[0];
-                            String paramName = tokens[1];
-                            paramList.add(new Parameter(paramType, paramName));
+                            paramList.add(new Parameter(tokens[0], tokens[1]));
                         }
                     }
                 }
                 FunctionDeclaration functionDecl = new FunctionDeclaration(returnType, methodName, paramList, i + 1);
-                // Check if the function is declared as synchronized.
                 if (modifiers != null && modifiers.contains("synchronized")) {
                     functionDecl.isSynchronized = true;
                 }
-                // The function header regex includes the opening brace; the body starts on the next line.
-                i++;
-                ParseResult result = parseBlock(lines, i);
-                // If the function is synchronized, wrap its body inside a synchronized(this) block.
+                // Build symbol table with parameters.
+                Map<String, VariableDeclaration> localSymbols = new HashMap<>();
+                for (Parameter p : paramList) {
+                    localSymbols.put(p.name, new VariableDeclaration(p.type, p.name, functionDecl.lineNumber));
+                }
+                i++; // move past function header
+                ParseResult result = parseBlock(lines, i, localSymbols);
                 if (functionDecl.isSynchronized) {
                     SynchronizedStatement outerSync = new SynchronizedStatement("this", functionDecl.lineNumber);
                     outerSync.enclosedStatements.addAll(result.statements);
+                    outerSync.objectType = currentClass;
+                    outerSync.objectDeclarationLine = "ground";
                     functionDecl.statements.add(outerSync);
                 } else {
                     functionDecl.statements.addAll(result.statements);
                 }
-                // Skip the closing brace line.
                 i = result.nextLineIndex + 1;
                 functions.add(functionDecl);
                 continue;
             }
-            // Process global-level synchronized block.
+            // Global-level synchronized blocks.
             Matcher syncMatcher = SYNCHRONIZED_PATTERN.matcher(line);
             if (syncMatcher.find()) {
                 String expression = syncMatcher.group(1).trim();
                 int syncLineNumber = i + 1;
                 i++;
-                ParseResult result = parseBlock(lines, i);
+                ParseResult result = parseBlock(lines, i, globalSymbols);
                 SynchronizedStatement syncStmt = new SynchronizedStatement(expression, syncLineNumber);
+                if ("this".equals(expression)) {
+                    syncStmt.objectType = currentClass;
+                    syncStmt.objectDeclarationLine = "ground";
+                } else {
+                    Matcher idMatcher = SIMPLE_IDENTIFIER_PATTERN.matcher(expression);
+                    if (idMatcher.find()) {
+                        VariableDeclaration decl = globalSymbols.get(expression);
+                        if (decl != null) {
+                            syncStmt.objectType = decl.type;
+                            syncStmt.objectDeclarationLine = String.valueOf(decl.lineNumber);
+                        }
+                    }
+                }
                 syncStmt.enclosedStatements.addAll(result.statements);
                 globalStatements.add(syncStmt);
                 i = result.nextLineIndex + 1;
                 continue;
             }
-            // Process global-level variable declaration.
+            // Global-level variable declarations.
             Matcher varMatcher = VARIABLE_PATTERN.matcher(line);
             if (varMatcher.find()) {
                 String varType = varMatcher.group(1);
                 String varName = varMatcher.group(2);
-                globalStatements.add(new VariableDeclaration(varType, varName, i + 1));
+                VariableDeclaration varDecl = new VariableDeclaration(varType, varName, i + 1);
+                globalStatements.add(varDecl);
+                globalSymbols.put(varName, varDecl);
                 i++;
                 continue;
             }
-            // Otherwise, treat as a generic global statement (skip lone closing braces).
             if (line.equals("}")) {
                 i++;
                 continue;
@@ -281,8 +363,54 @@ public class JavaSourceParser {
             i++;
         }
     }
-
-    // Methods to retrieve the parsed data.
+    
+    /**
+     * Produces a unique lock identifier for a synchronized statement.
+     * For "this", returns "this[<CurrentClass>]". Otherwise, if objectType is available,
+     * returns "expression(objectType)", else just the expression.
+     */
+    private String getLockId(SynchronizedStatement sync) {
+        if ("this".equals(sync.expression)) {
+            return "this[" + currentClass + "]";
+        } else if (sync.objectType != null) {
+            return sync.expression + "(" + sync.objectType + ")";
+        } else {
+            return sync.expression;
+        }
+    }
+    
+    /**
+     * Recursively traverses a list of statements and records nested lock acquisitions.
+     * When a synchronized statement is encountered, an edge is added from every lock
+     * currently held (in lockStack) to the new lock.
+     */
+    private void traverseStatements(List<Statement> statements, Deque<String> lockStack, LockOrderGraph graph) {
+        for (Statement stmt : statements) {
+            if (stmt instanceof SynchronizedStatement) {
+                SynchronizedStatement sync = (SynchronizedStatement) stmt;
+                String lockId = getLockId(sync);
+                for (String heldLock : lockStack) {
+                    graph.addEdge(heldLock, lockId);
+                }
+                lockStack.push(lockId);
+                traverseStatements(sync.enclosedStatements, lockStack, graph);
+                lockStack.pop();
+            }
+            // Other statements are ignored.
+        }
+    }
+    
+    /**
+     * Builds and returns a lock-order graph for a given function.
+     * This graph represents the nested lock acquisitions within that function.
+     */
+    public LockOrderGraph buildLockOrderGraphForFunction(FunctionDeclaration function) {
+        LockOrderGraph graph = new LockOrderGraph();
+        Deque<String> lockStack = new ArrayDeque<>();
+        traverseStatements(function.statements, lockStack, graph);
+        return graph;
+    }
+    
     public List<FunctionDeclaration> getFunctions() {
         return functions;
     }
@@ -291,7 +419,6 @@ public class JavaSourceParser {
         return globalStatements;
     }
 
-    // Utility method to print the parsed data.
     public void printParsedData() {
         System.out.println("---- Function Declarations ----");
         for (FunctionDeclaration func : functions) {
@@ -302,8 +429,7 @@ public class JavaSourceParser {
             System.out.println(stmt);
         }
     }
-
-    // Main method to test the parser.
+    
     public static void main(String[] args) {
         if (args.length < 1) {
             System.err.println("Usage: java JavaSourceParser <source-file.java>");
@@ -314,6 +440,14 @@ public class JavaSourceParser {
         try {
             parser.parse(file);
             parser.printParsedData();
+            // For each function, build and print its lock-order graph.
+            System.out.println("\n---- Lock-Order Graphs (Local per Function) ----");
+            for (FunctionDeclaration func : parser.getFunctions()) {
+                System.out.println("Function " + func.name + ":");
+                LockOrderGraph graph = parser.buildLockOrderGraphForFunction(func);
+                graph.printGraph();
+                System.out.println();
+            }
         } catch (IOException e) {
             System.err.println("Error reading file: " + e.getMessage());
             e.printStackTrace();

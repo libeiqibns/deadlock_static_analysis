@@ -47,8 +47,7 @@ public class JavaSourceParser {
         public String expression; // the monitor expression used in synchronized(...)
         public List<Statement> enclosedStatements;
         // Fields to record the type and declaration line of the monitor object.
-        public String objectType;          // For a normal variable, its type;
-                                          // For "this", the current class name.
+        public String objectType;          // For a normal variable, its type; for "this", the current class name.
         public String objectDeclarationLine;  // Either a numeric line (as a string) or "ground".
 
         public SynchronizedStatement(String expression, int lineNumber) {
@@ -131,11 +130,43 @@ public class JavaSourceParser {
         private Map<String, Set<String>> edges = new HashMap<>();
         
         public void addEdge(String from, String to) {
-            edges.computeIfAbsent(from, k -> new HashSet<>()).add(to);
+            if (edges.get(from) == null) {
+                edges.put(from, new HashSet<>());
+            }
+            edges.get(from).add(to);
         }
         
         public Map<String, Set<String>> getEdges() {
             return edges;
+        }
+
+        
+        public boolean hasCycle () {
+            Set<String> visited = new HashSet<>();
+            Set<String> onPath = new HashSet<>();
+            for (String node : edges.keySet()) {
+                if (hasCycle(node, visited, onPath)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private boolean hasCycle (String node, Set<String> visited, Set<String> onPath) {
+            if (onPath.contains(node)) {
+                return true;
+            }
+            if (visited.contains(node)) {
+                return false;
+            }
+            onPath.add(node);
+            for (String neighbor : edges.getOrDefault(node, new HashSet<>())) {
+                if (hasCycle(neighbor, visited, onPath)) {
+                    return true;
+                }
+            }
+            onPath.remove(node);
+            return false;
         }
         
         public void printGraph() {
@@ -177,7 +208,7 @@ public class JavaSourceParser {
     private static final Pattern SIMPLE_IDENTIFIER_PATTERN = Pattern.compile("^\\w+$");
 
     private static final Pattern CLASS_PATTERN = Pattern.compile("class\\s+(\\w+)");
-    
+
     // Helper class to hold the result of parsing a block.
     private static class ParseResult {
         public List<Statement> statements;
@@ -366,14 +397,14 @@ public class JavaSourceParser {
     
     /**
      * Produces a unique lock identifier for a synchronized statement.
-     * For "this", returns "this[<CurrentClass>]". Otherwise, if objectType is available,
-     * returns "expression(objectType)", else just the expression.
+     * The lock ID is marked with the class name and the line number where the monitor was declared.
+     * For "this", returns currentClass + ":ground". Otherwise, returns objectType + ":" + objectDeclarationLine.
      */
     private String getLockId(SynchronizedStatement sync) {
         if ("this".equals(sync.expression)) {
-            return "this[" + currentClass + "]";
-        } else if (sync.objectType != null) {
-            return sync.expression + "(" + sync.objectType + ")";
+            return currentClass + ":ground";
+        } else if (sync.objectType != null && sync.objectDeclarationLine != null) {
+            return sync.objectType + ":" + sync.objectDeclarationLine;
         } else {
             return sync.expression;
         }
@@ -396,7 +427,6 @@ public class JavaSourceParser {
                 traverseStatements(sync.enclosedStatements, lockStack, graph);
                 lockStack.pop();
             }
-            // Other statements are ignored.
         }
     }
     
@@ -409,6 +439,32 @@ public class JavaSourceParser {
         Deque<String> lockStack = new ArrayDeque<>();
         traverseStatements(function.statements, lockStack, graph);
         return graph;
+    }
+    
+
+    private String getCanonicalNodeId(String id) {
+        String [] splitId = id.split(":");
+        return splitId[0];
+    }
+
+    /**
+     * Merge the lock-order graphs from all functions
+     * into one global lock-order graph.
+     */
+    public LockOrderGraph mergeGlobalLockOrderGraph() {
+        LockOrderGraph mergedGraph = new LockOrderGraph();
+        // Aggregate edges from each function.
+        for (FunctionDeclaration func : functions) {
+            LockOrderGraph localGraph = buildLockOrderGraphForFunction(func);
+            for (Map.Entry<String, Set<String>> entry : localGraph.getEdges().entrySet()) {
+                String from = getCanonicalNodeId(entry.getKey());
+                for (String to : entry.getValue()) {
+                    to = getCanonicalNodeId(to);
+                    mergedGraph.addEdge(from, to);
+                }
+            }
+        }
+        return mergedGraph;
     }
     
     public List<FunctionDeclaration> getFunctions() {
@@ -439,14 +495,22 @@ public class JavaSourceParser {
         JavaSourceParser parser = new JavaSourceParser();
         try {
             parser.parse(file);
-            parser.printParsedData();
-            // For each function, build and print its lock-order graph.
+            // parser.printParsedData();
+            // Print lock-order graphs for each function.
             System.out.println("\n---- Lock-Order Graphs (Local per Function) ----");
             for (FunctionDeclaration func : parser.getFunctions()) {
                 System.out.println("Function " + func.name + ":");
-                LockOrderGraph graph = parser.buildLockOrderGraphForFunction(func);
-                graph.printGraph();
+                LockOrderGraph localGraph = parser.buildLockOrderGraphForFunction(func);
+                localGraph.printGraph();
                 System.out.println();
+            }
+            // Build and print the aggregated interprocedural lock-order graph.
+            System.out.println("---- Merged global Lock-Order Graph ----");
+            LockOrderGraph mergedGraph = parser.mergeGlobalLockOrderGraph();
+            mergedGraph.printGraph();
+            boolean graphHasCycle = mergedGraph.hasCycle();
+            if (graphHasCycle) {
+                System.err.println("Potential deadlock detected:");
             }
         } catch (IOException e) {
             System.err.println("Error reading file: " + e.getMessage());

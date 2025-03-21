@@ -183,6 +183,37 @@ public class JavaSourceParser {
             onPath.remove(node);
             return false;
         }
+
+        public List<List<String>> detectAllCycles() {
+            List<List<String>> cycles = new ArrayList<>();
+            Set<String> visited = new HashSet<>();
+            Set<String> onPath = new HashSet<>();
+            List<String> path = new ArrayList<>();
+            for (String node : edges.keySet()) {
+                detectAllCycles(node, visited, onPath, path, cycles);
+            }
+            return cycles;
+        }
+
+        private void detectAllCycles (String node, Set<String> visited, Set<String> onPath, List<String> path, List<List<String>> cycles) {
+            if (onPath.contains(node)) {
+                List<String> addPath = new ArrayList<> (path);
+                addPath.add(node);
+                cycles.add(addPath);
+                return;
+            }
+            if (visited.contains(node)) {
+                return;
+            }
+            onPath.add(node);
+            path.addLast(node);
+            for (String neighbor : edges.getOrDefault(node, new HashSet<>())) {
+                detectAllCycles(neighbor, visited, onPath, path, cycles);
+            }
+            path.removeLast();
+            onPath.remove(node);
+            
+        }
         
         public void printGraph() {
             System.out.println("Lock Order Graph:");
@@ -523,10 +554,12 @@ public class JavaSourceParser {
             System.out.println("---- Merged global Lock-Order Graph ----");
             LockOrderGraph mergedGraph = parser.mergeGlobalLockOrderGraph();
             mergedGraph.printGraph();
-            boolean graphHasCycle = mergedGraph.hasCycle();
-            if (graphHasCycle) {
-                System.err.println("Potential deadlock detected:");
-            }
+            // boolean graphHasCycle = mergedGraph.hasCycle();
+            // if (graphHasCycle) {
+            //     System.err.println("Potential deadlock detected!");
+            // }
+            List<List<String>> cycles = mergedGraph.detectAllCycles();
+            System.out.println(cycles.toString());
         } catch (IOException e) {
             System.err.println("Error reading file: " + e.getMessage());
             e.printStackTrace();

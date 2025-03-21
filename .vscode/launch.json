@@ -16,7 +16,7 @@
             "request": "launch",
             "args": 
             [
-                "${workspaceFolder}/src/SwapDeadlock.java" 
+                "${workspaceFolder}/src/A.java" 
             ], 
             "mainClass": "JavaSourceParser",
             "projectName": "deadlock_static_analysis"

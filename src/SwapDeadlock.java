@@ -10,11 +10,5 @@ public class SwapDeadlock {
             other.val = tmp;
         }
     }
-    public synchronized void swapVal2(SwapDeadlock other) {
-        synchronized(other) {
-            int tmp = this.val;
-            this.val = other.val;
-            other.val = tmp;
-        }
-    }
+
 }

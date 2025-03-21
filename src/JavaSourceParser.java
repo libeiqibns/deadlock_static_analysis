@@ -144,27 +144,42 @@ public class JavaSourceParser {
         public boolean hasCycle () {
             Set<String> visited = new HashSet<>();
             Set<String> onPath = new HashSet<>();
+            List<String> path = new ArrayList<>();
             for (String node : edges.keySet()) {
-                if (hasCycle(node, visited, onPath)) {
+                if (hasCycle(node, visited, onPath, path)) {
                     return true;
                 }
             }
             return false;
         }
 
-        private boolean hasCycle (String node, Set<String> visited, Set<String> onPath) {
+        private void printPath(List<String> path) {
+            System.out.println("Potential deadlock: ");
+            StringBuilder pathStr = new StringBuilder();
+            for (String node : path) {
+                pathStr.append(node);
+                pathStr.append("->");
+            }
+            pathStr.append(path.get(0));
+            System.out.println(pathStr.toString());
+        }
+
+        private boolean hasCycle (String node, Set<String> visited, Set<String> onPath, List<String> path) {
             if (onPath.contains(node)) {
+                printPath(path);
                 return true;
             }
             if (visited.contains(node)) {
                 return false;
             }
             onPath.add(node);
+            path.addLast(node);
             for (String neighbor : edges.getOrDefault(node, new HashSet<>())) {
-                if (hasCycle(neighbor, visited, onPath)) {
+                if (hasCycle(neighbor, visited, onPath, path)) {
                     return true;
                 }
             }
+            path.removeLast();
             onPath.remove(node);
             return false;
         }

@@ -124,9 +124,9 @@ public class JavaSourceParser {
         }
     }
     
-    // Each node in the lock-order graph is identified by a string (the lock’s unique ID).
+    // Each node in the lock-dependancy graph is identified by a string (the lock’s unique ID).
     // An edge from node A to node B means that while holding lock A, lock B is acquired.
-    public static class LockOrderGraph {
+    public static class LockDependancyGraph {
         private Map<String, Set<String>> edges = new HashMap<>();
         
         public void addEdge(String from, String to) {
@@ -458,16 +458,16 @@ public class JavaSourceParser {
     
     /**
      * Recursively traverses a list of statements and records nested lock acquisitions.
-     * When a synchronized statement is encountered, an edge is added from every lock
-     * currently held (in lockStack) to the new lock.
+     * When a synchronized statement is encountered, an edge is added from most-recent lock
+     * to the new lock.
      */
-    private void traverseStatements(List<Statement> statements, Deque<String> lockStack, LockOrderGraph graph) {
+    private void traverseStatements(List<Statement> statements, Deque<String> lockStack, LockDependancyGraph graph) {
         for (Statement stmt : statements) {
             if (stmt instanceof SynchronizedStatement) {
                 SynchronizedStatement sync = (SynchronizedStatement) stmt;
                 String lockId = getLockId(sync);
-                for (String heldLock : lockStack) {
-                    graph.addEdge(heldLock, lockId);
+                if (!lockStack.isEmpty()) {
+                    graph.addEdge(lockStack.getFirst(), lockId);
                 }
                 lockStack.push(lockId);
                 traverseStatements(sync.enclosedStatements, lockStack, graph);
@@ -477,11 +477,11 @@ public class JavaSourceParser {
     }
     
     /**
-     * Builds and returns a lock-order graph for a given function.
+     * Builds and returns a lock-dependancy graph for a given function.
      * This graph represents the nested lock acquisitions within that function.
      */
-    public LockOrderGraph buildLockOrderGraphForFunction(FunctionDeclaration function) {
-        LockOrderGraph graph = new LockOrderGraph();
+    public LockDependancyGraph buildLockDependancyGraphForFunction(FunctionDeclaration function) {
+        LockDependancyGraph graph = new LockDependancyGraph();
         Deque<String> lockStack = new ArrayDeque<>();
         traverseStatements(function.statements, lockStack, graph);
         return graph;
@@ -494,14 +494,14 @@ public class JavaSourceParser {
     }
 
     /**
-     * Merge the lock-order graphs from all functions
-     * into one global lock-order graph.
+     * Merge the lock-dependancy graphs from all functions
+     * into one global lock-dependancy graph.
      */
-    public LockOrderGraph mergeGlobalLockOrderGraph() {
-        LockOrderGraph mergedGraph = new LockOrderGraph();
+    public LockDependancyGraph mergeGlobalLockDependancyGraph() {
+        LockDependancyGraph mergedGraph = new LockDependancyGraph();
         // Aggregate edges from each function.
         for (FunctionDeclaration func : functions) {
-            LockOrderGraph localGraph = buildLockOrderGraphForFunction(func);
+            LockDependancyGraph localGraph = buildLockDependancyGraphForFunction(func);
             for (Map.Entry<String, Set<String>> entry : localGraph.getEdges().entrySet()) {
                 String from = getCanonicalNodeId(entry.getKey());
                 for (String to : entry.getValue()) {
@@ -542,17 +542,17 @@ public class JavaSourceParser {
         try {
             parser.parse(file);
             // parser.printParsedData();
-            // Print lock-order graphs for each function.
-            System.out.println("\n---- Lock-Order Graphs (Local per Function) ----");
+            // Print lock-dependancy graphs for each function.
+            System.out.println("\n---- lock-dependancy graphs (Local per Function) ----");
             for (FunctionDeclaration func : parser.getFunctions()) {
                 System.out.println("Function " + func.name + ":");
-                LockOrderGraph localGraph = parser.buildLockOrderGraphForFunction(func);
+                LockDependancyGraph localGraph = parser.buildLockDependancyGraphForFunction(func);
                 localGraph.printGraph();
                 System.out.println();
             }
-            // Build and print the aggregated interprocedural lock-order graph.
-            System.out.println("---- Merged global Lock-Order Graph ----");
-            LockOrderGraph mergedGraph = parser.mergeGlobalLockOrderGraph();
+            // Build and print the aggregated interprocedural lock-dependancy graph.
+            System.out.println("---- Merged global lock-dependancy graph ----");
+            LockDependancyGraph mergedGraph = parser.mergeGlobalLockDependancyGraph();
             mergedGraph.printGraph();
             // boolean graphHasCycle = mergedGraph.hasCycle();
             // if (graphHasCycle) {

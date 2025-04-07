@@ -76,6 +76,32 @@ public class JavaSourceParser {
         }
     }
 
+    // Statement type for wait statements.
+    public static class WaitStatement extends Statement {
+        public String expression; // the variable name or "this"
+        public String objectType; // the type of the variable or "this"
+        public String objectDeclarationLine; // the line number where the variable is declared or "ground"
+        public WaitStatement(String expression, int lineNumber) {
+            super(lineNumber);
+            this.expression = expression;
+            this.objectType = null;
+            this.objectDeclarationLine = null;
+        }
+        @Override
+        public String toString() {
+            StringBuilder sb = new StringBuilder();
+            sb.append("Line ").append(lineNumber)
+              .append(": wait(").append(expression);
+            if (objectType != null) {
+                sb.append(" /* type: ").append(objectType)
+                  .append(", declared at: ").append(objectDeclarationLine)
+                  .append(" */");
+            }
+            sb.append(");");
+            return sb.toString();
+        }
+    }
+
     // Class representing a function/method declaration.
     public static class FunctionDeclaration {
         public String returnType;
@@ -251,6 +277,9 @@ public class JavaSourceParser {
     private static final Pattern SYNCHRONIZED_PATTERN = Pattern.compile(
             "synchronized\\s*\\(([^)]+)\\)\\s*\\{");
 
+    private static final Pattern WAI_PATTERN = Pattern.compile(
+            "(?:(\\w+)\\s*\\.)?" +         // optional variable name
+            "wait\\s*\\(\\s*\\)\\s*;");
     private static final Pattern SIMPLE_IDENTIFIER_PATTERN = Pattern.compile("^\\w+$");
 
     private static final Pattern CLASS_PATTERN = Pattern.compile("class\\s+(\\w+)");
@@ -311,6 +340,33 @@ public class JavaSourceParser {
                 i = innerResult.nextLineIndex + 1;
                 continue;
             }
+            // Handle wait statements.
+            Matcher waitMatcher = WAI_PATTERN.matcher(line);
+            if (waitMatcher.find()) {
+                String expression = waitMatcher.group(1);
+                if (expression == null) {
+                    expression = "this";
+                }
+                int waitLineNumber = i + 1;
+                WaitStatement waitStmt = new WaitStatement(expression, waitLineNumber);
+                if ("this".equals(expression)) {
+                    waitStmt.objectType = currentClass;
+                    waitStmt.objectDeclarationLine = "ground";
+                } else {
+                    Matcher idMatcher = SIMPLE_IDENTIFIER_PATTERN.matcher(expression);
+                    if (idMatcher.find()) {
+                        VariableDeclaration decl = currentSymbols.get(expression);
+                        if (decl != null) {
+                            waitStmt.objectType = decl.type;
+                            waitStmt.objectDeclarationLine = String.valueOf(decl.lineNumber);
+                        }
+                    }
+                }
+                statements.add(waitStmt);
+                i++;
+                continue;
+            }
+
             // Variable declarations.
             Matcher varMatcher = VARIABLE_PATTERN.matcher(line);
             if (varMatcher.find()) {
@@ -455,6 +511,16 @@ public class JavaSourceParser {
             return sync.expression;
         }
     }
+
+    private String getLockId(WaitStatement sync) {
+        if ("this".equals(sync.expression)) {
+            return currentClass + ":ground";
+        } else if (sync.objectType != null && sync.objectDeclarationLine != null) {
+            return sync.objectType + ":" + sync.objectDeclarationLine;
+        } else {
+            return sync.expression;
+        }
+    }
     
     /**
      * Recursively traverses a list of statements and records nested lock acquisitions.
@@ -472,6 +538,16 @@ public class JavaSourceParser {
                 lockStack.push(lockId);
                 traverseStatements(sync.enclosedStatements, lockStack, graph);
                 lockStack.pop();
+            }
+            else if (stmt instanceof WaitStatement) {
+                WaitStatement waitStmt = (WaitStatement) stmt;
+                String lockId = getLockId(waitStmt);
+                // wait statements are represented as edges from the current lock to the wait lock.
+                // if the wait lock is also the most recent lock, we don't add an edge.
+                if (!lockStack.isEmpty() && !lockStack.getFirst().equals(lockId)) {
+                    graph.addEdge(lockStack.getFirst(), lockId);
+                }
+                // wait statements are not added to the lock stack.
             }
         }
     }
@@ -541,7 +617,7 @@ public class JavaSourceParser {
         JavaSourceParser parser = new JavaSourceParser();
         try {
             parser.parse(file);
-            // parser.printParsedData();
+            parser.printParsedData();
             // Print lock-dependancy graphs for each function.
             System.out.println("\n---- lock-dependancy graphs (Local per Function) ----");
             for (FunctionDeclaration func : parser.getFunctions()) {
@@ -559,7 +635,7 @@ public class JavaSourceParser {
             //     System.err.println("Potential deadlock detected!");
             // }
             List<List<String>> cycles = mergedGraph.detectAllCycles();
-            System.out.println(cycles.toString());
+            System.out.println("Potential deadlock paths: " + cycles.toString());
         } catch (IOException e) {
             System.err.println("Error reading file: " + e.getMessage());
             e.printStackTrace();

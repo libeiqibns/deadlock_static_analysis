@@ -8,22 +8,26 @@ public class A {
     B lock;
     public void foo(B b1, C c1) {
         synchronized(b1) {
-            System.out.println("");
+            // some statements
             synchronized (c1) {
-                System.out.println("");
+                // some statements
                 synchronized (this) {
-                    System.out.println("");
+                    // some statements
                 }
             }
         }
     }
     
-    public synchronized void bar(B b2, C c2) {
-        synchronized(b2) {
-            System.out.println("");
-        }
-        synchronized(c2) {
-            System.out.println("");
+    public synchronized void bar(B b2, C c2) throws InterruptedException {
+        if (true) {
+            synchronized(b2) {
+                // some statements
+            }
+        } else {
+            synchronized(c2) {
+                // some statements
+                c2.wait(  );
+            }
         }
     }
 }

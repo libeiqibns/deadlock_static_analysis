@@ -104,6 +104,7 @@ public class JavaSourceParser {
 
     // Class representing a function/method declaration.
     public static class FunctionDeclaration {
+        public String className;
         public String returnType;
         public String name;
         public List<Parameter> parameters;
@@ -112,6 +113,7 @@ public class JavaSourceParser {
         public boolean isSynchronized;   // true if declared with the synchronized modifier
 
         public FunctionDeclaration(String returnType, String name, List<Parameter> parameters, int lineNumber) {
+            this.className = null; // to be set later
             this.returnType = returnType;
             this.name = name;
             this.parameters = parameters;
@@ -253,13 +255,14 @@ public class JavaSourceParser {
     }
     
     // Global collections to hold parsed data.
-    private List<FunctionDeclaration> functions = new ArrayList<>();
-    private List<Statement> globalStatements = new ArrayList<>();
+    private final List<FunctionDeclaration> functions = new ArrayList<>();
+    private final List<Statement> globalStatements = new ArrayList<>();
     // Global symbol table for top-level declarations.
-    private Map<String, VariableDeclaration> globalSymbols = new HashMap<>();
+    private final Map<String, VariableDeclaration> globalSymbols = new HashMap<>();
     
     // Current class name found in the source file.
     private String currentClass = "Unknown";
+    private FunctionDeclaration currentFunction = null;
     
     // Precompiled regex patterns.
     private static final Pattern FUNCTION_PATTERN = Pattern.compile(
@@ -428,6 +431,7 @@ public class JavaSourceParser {
                     }
                 }
                 FunctionDeclaration functionDecl = new FunctionDeclaration(returnType, methodName, paramList, i + 1);
+                functionDecl.className = currentClass;
                 if (modifiers != null && modifiers.contains("synchronized")) {
                     functionDecl.isSynchronized = true;
                 }
@@ -502,9 +506,9 @@ public class JavaSourceParser {
      * The lock ID is marked with the class name and the line number where the monitor was declared.
      * For "this", returns currentClass + ":ground". Otherwise, returns objectType + ":" + objectDeclarationLine.
      */
-    private String getLockId(SynchronizedStatement sync) {
+    private String getLockId(String functionClass, SynchronizedStatement sync) {
         if ("this".equals(sync.expression)) {
-            return currentClass + ":ground";
+            return functionClass + ":ground";
         } else if (sync.objectType != null && sync.objectDeclarationLine != null) {
             return sync.objectType + ":" + sync.objectDeclarationLine;
         } else {
@@ -512,9 +516,9 @@ public class JavaSourceParser {
         }
     }
 
-    private String getLockId(WaitStatement sync) {
+    private String getLockId(String functionClass, WaitStatement sync) {
         if ("this".equals(sync.expression)) {
-            return currentClass + ":ground";
+            return functionClass + ":ground";
         } else if (sync.objectType != null && sync.objectDeclarationLine != null) {
             return sync.objectType + ":" + sync.objectDeclarationLine;
         } else {
@@ -527,21 +531,21 @@ public class JavaSourceParser {
      * When a synchronized statement is encountered, an edge is added from most-recent lock
      * to the new lock.
      */
-    private void traverseStatements(List<Statement> statements, Deque<String> lockStack, LockDependancyGraph graph) {
+    private void traverseStatements(String functionClass, List<Statement> statements, Deque<String> lockStack, LockDependancyGraph graph) {
         for (Statement stmt : statements) {
             if (stmt instanceof SynchronizedStatement) {
                 SynchronizedStatement sync = (SynchronizedStatement) stmt;
-                String lockId = getLockId(sync);
+                String lockId = getLockId(functionClass, sync);
                 if (!lockStack.isEmpty()) {
                     graph.addEdge(lockStack.getFirst(), lockId);
                 }
                 lockStack.push(lockId);
-                traverseStatements(sync.enclosedStatements, lockStack, graph);
+                traverseStatements(functionClass, sync.enclosedStatements, lockStack, graph);
                 lockStack.pop();
             }
             else if (stmt instanceof WaitStatement) {
                 WaitStatement waitStmt = (WaitStatement) stmt;
-                String lockId = getLockId(waitStmt);
+                String lockId = getLockId(functionClass, waitStmt);
                 // wait statements are represented as edges from the current lock to the wait lock.
                 // if the wait lock is also the most recent lock, we don't add an edge.
                 if (!lockStack.isEmpty() && !lockStack.getFirst().equals(lockId)) {
@@ -559,7 +563,7 @@ public class JavaSourceParser {
     public LockDependancyGraph buildLockDependancyGraphForFunction(FunctionDeclaration function) {
         LockDependancyGraph graph = new LockDependancyGraph();
         Deque<String> lockStack = new ArrayDeque<>();
-        traverseStatements(function.statements, lockStack, graph);
+        traverseStatements(function.className, function.statements, lockStack, graph);
         return graph;
     }
     
@@ -607,37 +611,52 @@ public class JavaSourceParser {
             System.out.println(stmt);
         }
     }
-    
+    // Updated to support processing multiple files
+    public void parseAllFiles(List<File> files) throws IOException {
+        // Clear any existing state
+        functions.clear();
+        globalStatements.clear();
+        globalSymbols.clear();
+        
+        // Parse each file
+        for (File file : files) {
+            parse(file);
+        }
+    }
+
+    // Updated main method to handle multiple files
     public static void main(String[] args) {
         if (args.length < 1) {
-            System.err.println("Usage: java JavaSourceParser <source-file.java>");
+            System.err.println("Usage: java JavaSourceParser <source-file1.java> [source-file2.java ...]");
             System.exit(1);
         }
-        File file = new File(args[0]);
+
+        List<File> files = new ArrayList<>();
+        for (String arg : args) {
+            files.add(new File(arg));
+        }
+
         JavaSourceParser parser = new JavaSourceParser();
         try {
-            parser.parse(file);
+            parser.parseAllFiles(files);
             parser.printParsedData();
-            // Print lock-dependancy graphs for each function.
-            System.out.println("\n---- lock-dependancy graphs (Local per Function) ----");
+            
+            System.out.println("\n---- Lock-dependancy graphs (Local per Function) ----");
             for (FunctionDeclaration func : parser.getFunctions()) {
                 System.out.println("Function " + func.name + ":");
                 LockDependancyGraph localGraph = parser.buildLockDependancyGraphForFunction(func);
                 localGraph.printGraph();
                 System.out.println();
             }
-            // Build and print the aggregated interprocedural lock-dependancy graph.
+
             System.out.println("---- Merged global lock-dependancy graph ----");
             LockDependancyGraph mergedGraph = parser.mergeGlobalLockDependancyGraph();
             mergedGraph.printGraph();
-            // boolean graphHasCycle = mergedGraph.hasCycle();
-            // if (graphHasCycle) {
-            //     System.err.println("Potential deadlock detected!");
-            // }
+            
             List<List<String>> cycles = mergedGraph.detectAllCycles();
             System.out.println("Potential deadlock paths: " + cycles.toString());
         } catch (IOException e) {
-            System.err.println("Error reading file: " + e.getMessage());
+            System.err.println("Error reading files: " + e.getMessage());
             e.printStackTrace();
         }
     }

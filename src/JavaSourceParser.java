@@ -262,7 +262,6 @@ public class JavaSourceParser {
     
     // Current class name found in the source file.
     private String currentClass = "Unknown";
-    private FunctionDeclaration currentFunction = null;
     
     // Precompiled regex patterns.
     private static final Pattern FUNCTION_PATTERN = Pattern.compile(

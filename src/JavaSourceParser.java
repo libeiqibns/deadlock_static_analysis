@@ -138,6 +138,23 @@ public class JavaSourceParser {
         }
     }
 
+    // Class representing a function call.
+    public static class FunctionCall extends Statement {
+        public String returnType;
+        public String name;
+        public List<Parameter> parameters;
+        public FunctionCall(String returnType, String name, List<Parameter> parameters, int lineNumber) {
+            super(lineNumber);
+            this.returnType = returnType;
+            this.name = name;
+            this.parameters = parameters;
+        }
+        @Override
+        public String toString() {
+            return "Line " + lineNumber + ": " + returnType + " " + name + "(" + parameters + ");";
+        }
+    }
+
     // Class representing a function parameter.
     public static class Parameter {
         public String type;
@@ -155,7 +172,7 @@ public class JavaSourceParser {
     // Each node in the lock-dependancy graph is identified by a string (the lock’s unique ID).
     // An edge from node A to node B means that while holding lock A, lock B is acquired.
     public static class LockDependancyGraph {
-        private Map<String, Set<String>> edges = new HashMap<>();
+        private final Map<String, Set<String>> edges = new HashMap<>();
         
         public void addEdge(String from, String to) {
             if (edges.get(from) == null) {
@@ -264,13 +281,17 @@ public class JavaSourceParser {
     private String currentClass = "Unknown";
     
     // Precompiled regex patterns.
-    private static final Pattern FUNCTION_PATTERN = Pattern.compile(
+    private static final Pattern FUNCTION_DECLARATION_PATTERN = Pattern.compile(
             "((?:public|protected|private|static|final|abstract|synchronized)\\s+)*" + // optional modifiers
             "([\\w<>\\[\\]]+)\\s+" +                   // return type
             "(\\w+)\\s*" +                            // method name
             "\\(([^)]*)\\)\\s*" +                      // parameter list
             "(?:throws\\s+[\\w\\s,]+)?\\s*\\{");        // optional throws clause and opening brace
 
+    private static final Pattern FUNCTION_CALL_PATTERN = Pattern.compile(
+            "(?:([\\w<>\\[\\]]+)\\s*=\\s*)?" +   // optional return value assignment
+            "(\\w+)\\s*\\(([^)]*)\\)\\s*;");     // function call with parameters
+    
     private static final Pattern VARIABLE_PATTERN = Pattern.compile(
             "([\\w<>\\[\\]]+)\\s+" +    // variable type
             "(\\w+)\\s*" +              // variable name
@@ -380,6 +401,33 @@ public class JavaSourceParser {
                 i++;
                 continue;
             }
+
+            // Function calls.
+            Matcher funcCallMatcher = FUNCTION_CALL_PATTERN.matcher(line);
+            if (funcCallMatcher.find()) {
+                String returnType = funcCallMatcher.group(1);
+                String methodName = funcCallMatcher.group(2);
+                String params = funcCallMatcher.group(3).trim();
+                List<Parameter> paramList = new ArrayList<>();
+                if (!params.isEmpty()) {
+                    String[] paramParts = params.split(",");
+                    for (String param : paramParts) {
+                        param = param.trim();
+                        VariableDeclaration decl = currentSymbols.get(param);
+                        if (decl != null) {
+                            paramList.add(new Parameter(decl.type, decl.name));
+                        } else {
+                            throw new IllegalArgumentException("Undefined variable: " + param + " at line " + (i + 1));
+                        }
+                    }
+                }
+
+                FunctionCall functionCall = new FunctionCall(returnType, methodName, paramList, i + 1);
+                statements.add(functionCall);
+                i++;
+                continue;
+            }
+
             // Otherwise, a generic statement.
             statements.add(new GenericStatement(line, i + 1));
             i++;
@@ -412,7 +460,7 @@ public class JavaSourceParser {
                 continue;
             }
             // Function declarations.
-            Matcher funcMatcher = FUNCTION_PATTERN.matcher(line);
+            Matcher funcMatcher = FUNCTION_DECLARATION_PATTERN.matcher(line);
             if (funcMatcher.find()) {
                 String modifiers = funcMatcher.group(1);
                 String returnType = funcMatcher.group(2);
@@ -551,6 +599,33 @@ public class JavaSourceParser {
                     graph.addEdge(lockStack.getFirst(), lockId);
                 }
                 // wait statements are not added to the lock stack.
+            }
+            else if (stmt instanceof FunctionCall) {
+                FunctionCall funcCall = (FunctionCall) stmt;
+                // link the function call to corresponding function declaration.
+                for (FunctionDeclaration func : functions) {
+                    if (func.name.equals(funcCall.name) && func.parameters.size() == funcCall.parameters.size()) {
+                        // Check if the parameter types match.
+                        boolean match = true;
+                        for (int j = 0; j < func.parameters.size(); j++) {
+                            if (!func.parameters.get(j).type.equals(funcCall.parameters.get(j).type)) {
+                                match = false;
+                                break;
+                            }
+                        }
+                        if (match) {
+                            // Recursively traverse the function body.
+                            traverseStatements(func.className, func.statements, lockStack, graph);
+                            break; // No need to check other functions.
+                        }
+                    }
+                }
+            }
+            else if (stmt instanceof GenericStatement) {
+                // Handle generic statements if needed.
+            }
+            else {
+                throw new IllegalArgumentException("Unknown statement type: " + stmt.getClass().getName());
             }
         }
     }

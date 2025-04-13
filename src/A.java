@@ -22,6 +22,7 @@ public class A {
         if (true) {
             synchronized(b2) {
                 // some statements
+                foo(b2, c2);
             }
         } else {
             synchronized(c2) {

@@ -553,20 +553,46 @@ public class JavaSourceParser {
      * The lock ID is marked with the class name and the line number where the monitor was declared.
      * For "this", returns currentClass + ":ground". Otherwise, returns objectType + ":" + objectDeclarationLine.
      */
-    private String getLockId(String functionClass, SynchronizedStatement sync) {
+    private String getLockId(String functionClass, SynchronizedStatement sync, boolean isCallee, Map<String, VariableDeclaration> localSymbols) {
         if ("this".equals(sync.expression)) {
             return functionClass + ":ground";
         } else if (sync.objectType != null && sync.objectDeclarationLine != null) {
+            if (isCallee) {
+                // If the lock is a parameter, use the parameter's type and line number.
+                VariableDeclaration decl = localSymbols.get(sync.expression);
+                if (decl != null) {
+                    return decl.type + ":" + decl.lineNumber;
+                }
+            } else {
+                // If the lock is a global variable, use the global variable's type and line number.
+                VariableDeclaration decl = globalSymbols.get(sync.expression);
+                if (decl != null) {
+                    return decl.type + ":" + decl.lineNumber;
+                }
+            }
             return sync.objectType + ":" + sync.objectDeclarationLine;
         } else {
             return sync.expression;
         }
     }
 
-    private String getLockId(String functionClass, WaitStatement sync) {
+    private String getLockId(String functionClass, WaitStatement sync, boolean isCallee, Map<String, VariableDeclaration> localSymbols) {
         if ("this".equals(sync.expression)) {
             return functionClass + ":ground";
         } else if (sync.objectType != null && sync.objectDeclarationLine != null) {
+            if (isCallee) {
+                // If the lock is a parameter, use the parameter's type and line number.
+                VariableDeclaration decl = localSymbols.get(sync.expression);
+                if (decl != null) {
+                    return decl.type + ":" + decl.lineNumber;
+                }
+            } else {
+                // If the lock is a global variable, use the global variable's type and line number.
+                VariableDeclaration decl = globalSymbols.get(sync.expression);
+                if (decl != null) {
+                    return decl.type + ":" + decl.lineNumber;
+                }
+            }
             return sync.objectType + ":" + sync.objectDeclarationLine;
         } else {
             return sync.expression;
@@ -578,11 +604,16 @@ public class JavaSourceParser {
      * When a synchronized statement is encountered, an edge is added from most-recent lock
      * to the new lock.
      */
-    private void traverseStatements(String functionClass, List<Statement> statements, Deque<String> lockStack, LockDependancyGraph graph) {
+    private void traverseStatements(String functionClass, List<Statement> statements, Deque<String> lockStack, LockDependancyGraph graph, 
+                                    boolean isCallee, Map<String, VariableDeclaration> localSymbols) {
         for (Statement stmt : statements) {
-            if (stmt instanceof SynchronizedStatement) {
+            if (stmt instanceof VariableDeclaration) {
+                VariableDeclaration varDecl = (VariableDeclaration) stmt;
+                localSymbols.put(varDecl.name, varDecl);
+            }
+            else if (stmt instanceof SynchronizedStatement) {
                 SynchronizedStatement sync = (SynchronizedStatement) stmt;
-                String lockId = getLockId(functionClass, sync);
+                String lockId = getLockId(functionClass, sync, isCallee, localSymbols);
                 // synchronized statements are represented as edges from the current lock to the new lock.
                 // to avoid self-loops, we check if the lock is already on the stack.
                 // if the lock is already on the stack, we don't add an edge.
@@ -590,12 +621,25 @@ public class JavaSourceParser {
                     graph.addEdge(lockStack.getFirst(), lockId);
                 }
                 lockStack.push(lockId);
-                traverseStatements(functionClass, sync.enclosedStatements, lockStack, graph);
+                traverseStatements(functionClass, sync.enclosedStatements, lockStack, graph, isCallee, localSymbols);
+                lockStack.pop();
+            }
+            else if (stmt instanceof SynchronizedStatement) {
+                SynchronizedStatement sync = (SynchronizedStatement) stmt;
+                String lockId = getLockId(functionClass, sync, isCallee, localSymbols);
+                // synchronized statements are represented as edges from the current lock to the new lock.
+                // to avoid self-loops, we check if the lock is already on the stack.
+                // if the lock is already on the stack, we don't add an edge.
+                if (!lockStack.isEmpty() && !lockStack.contains(lockId)) {
+                    graph.addEdge(lockStack.getFirst(), lockId);
+                }
+                lockStack.push(lockId);
+                traverseStatements(functionClass, sync.enclosedStatements, lockStack, graph, isCallee, localSymbols);
                 lockStack.pop();
             }
             else if (stmt instanceof WaitStatement) {
                 WaitStatement waitStmt = (WaitStatement) stmt;
-                String lockId = getLockId(functionClass, waitStmt);
+                String lockId = getLockId(functionClass, waitStmt, isCallee, localSymbols);
                 // wait statements are represented as edges from the current lock to the wait lock.
                 // if the wait lock is also the most recent lock, we don't add an edge.
                 if (!lockStack.isEmpty() && !lockStack.getFirst().equals(lockId)) {
@@ -617,8 +661,19 @@ public class JavaSourceParser {
                             }
                         }
                         if (match) {
+                            Map <String, VariableDeclaration> calleeLocalSymbols = new HashMap<>();
+                            for (int i = 0; i < func.parameters.size(); i++) {
+                                Parameter formalP = func.parameters.get(i);
+                                Parameter actualP = funcCall.parameters.get(i);
+                                if (localSymbols.containsKey(actualP.name)) {
+                                    calleeLocalSymbols.put(formalP.name, localSymbols.get(actualP.name));
+                                } else {
+                                    throw new IllegalArgumentException("Undefined variable: " + actualP.name + " at line " + funcCall.lineNumber);
+                                }
+                            }
+                            
                             // Recursively traverse the function body.
-                            traverseStatements(func.className, func.statements, lockStack, graph);
+                            traverseStatements(func.className, func.statements, lockStack, graph, true, calleeLocalSymbols);
                             break; // No need to check other functions.
                         }
                     }
@@ -640,7 +695,12 @@ public class JavaSourceParser {
     public LockDependancyGraph buildLockDependancyGraphForFunction(FunctionDeclaration function) {
         LockDependancyGraph graph = new LockDependancyGraph();
         Deque<String> lockStack = new ArrayDeque<>();
-        traverseStatements(function.className, function.statements, lockStack, graph);
+        Map<String, VariableDeclaration> localSymbols = new HashMap<>();
+        for (Parameter p : function.parameters) {
+            localSymbols.put(p.name, new VariableDeclaration(p.type, p.name, function.lineNumber));
+        }
+
+        traverseStatements(function.className, function.statements, lockStack, graph, false, localSymbols);
         return graph;
     }
     

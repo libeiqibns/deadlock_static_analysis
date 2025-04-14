@@ -583,7 +583,10 @@ public class JavaSourceParser {
             if (stmt instanceof SynchronizedStatement) {
                 SynchronizedStatement sync = (SynchronizedStatement) stmt;
                 String lockId = getLockId(functionClass, sync);
-                if (!lockStack.isEmpty()) {
+                // synchronized statements are represented as edges from the current lock to the new lock.
+                // to avoid self-loops, we check if the lock is already on the stack.
+                // if the lock is already on the stack, we don't add an edge.
+                if (!lockStack.isEmpty() && !lockStack.contains(lockId)) {
                     graph.addEdge(lockStack.getFirst(), lockId);
                 }
                 lockStack.push(lockId);
